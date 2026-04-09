@@ -133,6 +133,16 @@ def add_parameters(parameters: protocol_api.ParameterContext):
         maximum = 1000
     )
 
+    # simulate_use: 500.0
+    parameters.add_float(
+        variable_name="folding_reaction_volume",
+        display_name="Folding Reaction Volume",
+        description="Volume of Folding Reaction",
+        default=500.0, #Change
+        minimum=50.0,
+        maximum=1000.0
+    )
+
     # Allow Tip Refill
     parameters.add_bool(
         variable_name="tip_refill",
@@ -360,7 +370,7 @@ def run(protocol: protocol_api.ProtocolContext):
     # Pause Protocol
     protocol.pause("Continue to add reagents to folding reactions.")
 
-    l    # Set source and destination racks
+    # Set source and destination racks
     source = tube_rack_2
     dest = tube_rack_1
 

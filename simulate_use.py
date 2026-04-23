@@ -21,6 +21,7 @@ PARSER = {
 def parse_protocol_annotation(handle):
     """parse annotation that takes form of either:
     `# simulate-use: xxx`
+    `# simulate_use: xxx`
     `_simulate_use = xxx`
 
     Args:
@@ -41,7 +42,7 @@ def parse_protocol_annotation(handle):
 
     for obj in func.body:
         for line in lines[prev_end:obj.lineno - 1]:
-            if m := re.match(r'\s*#\s*simulate-use\s*:(.+)', line):
+            if m := re.match(r'\s*#\s*simulate[-_]use\s*:(.+)', line):
                 prev_use_val = m[1].strip()
 
         if prev_use_val and isinstance(obj, ast.Expr) and isinstance(obj.value, ast.Call):

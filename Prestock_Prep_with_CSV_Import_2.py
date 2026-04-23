@@ -1,15 +1,9 @@
-
-
 from opentrons import protocol_api
 import math
 import json
 from dataclasses import dataclass
-from typing import Union, Any, List
-import itertools
+from typing import Union, List
 import csv
-
-
-# TODO: Check if labware names give Protocol Designer and issue with uploads
 
 metadata = {
     'protocolName': 'Prestock Preparation with CSV import',
@@ -22,7 +16,6 @@ requirements = {
     'apiLevel': '2.25'
 }
 
-# Define the expected headers for the CSV file
 HEADERS = [
     "Source Plate",
     "Part",
@@ -32,6 +25,7 @@ HEADERS = [
     "Destination Well",
     "Transfer Volume (ul)"
 ]
+
 
 @dataclass
 class Transfer:
@@ -43,42 +37,15 @@ class Transfer:
     dest_well: str
     volume: float
     source_slot: str = ""
-    destination_slot: str = "D1" # For prestock transfer
-
-    def set_source_slot(self, source_plate_slots: dict[str, str]):
-        """
-        Set the source slot for this transfer from mapping of source plate names to slot on deck
-        :param source_plate_slots: dictionary of source plate slots to plate names
-        """
-        try:
-            self.source_slot = source_plate_slots[self.source_name]
-        except KeyError:
-            raise KeyError(f"Source plate '{self.source_name}' not found in plate mapping")
-
-@dataclass
-class Prestock:
-    ps_name: str
-    tube_location: str
-    volume: float
-    num_oligos: int
-
-    def update_volume(self, transfer_amount: float):
-        if transfer_amount < 0:
-            raise ValueError("transfer_amount must be non-negative")
-        if transfer_amount > self.volume:
-            raise ValueError("transfer_amount exceeds current volume")
-        self.volume -= transfer_amount
-        return self.volume
 
 
-# Need to fix source labware
 def parse_csv_as_lists(
         file_path: str,
         detect_dialect: bool = True,
-        **kwargs: Any,
+        **kwargs,
 ) -> List[List[str]]:
     """Parse a CSV file into List[List[str]], mimicking CSVParameter.parse_as_csv()."""
-    with open(file_path, "r", encoding="utf-8", newline="") as f:
+    with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
         content = f.read()
 
     rows: List[List[str]] = []
@@ -97,49 +64,38 @@ def parse_csv_as_lists(
     for row in reader:
         rows.append(row)
 
-        # Remove trailing empty rows
     while rows and rows[-1] == []:
         rows.pop()
+
     return rows
 
 
-def read_transfers(csv_data:List[List[Union[str, int, float]]], src_labware, src_slot: dict[str,str]) -> List[Transfer]:
+def read_transfers(csv_data: List[List[Union[str, int, float]]], src_labware: str, src_slot: dict) -> List[Transfer]:
     """
-    Converts list of transfers into a list of Transfer objects so that each unique transfer has
-    addressable properties that will be called during the run. Also creates a prestock object
-    which is like a simplified transfer object.
+    Converts CSV rows into Transfer objects with addressable properties for use during the run.
     """
-
-    # Check if headers match the correct file formate
     headers = csv_data[0]
     assert headers == HEADERS, f"Expected: {HEADERS}, got: {headers}"
-    #TODO: Validate Data
-
 
     transfers = []
-    transfer_data = csv_data[1:]
-    for row in transfer_data:
-
+    for row in csv_data[1:]:
         transfer = Transfer(
             source_name=row[0],
             source_part=row[1],
-            source_labware = src_labware,
-            source_well = expand_well_range(row[2], row[3]),
-            dest_name = row[4],
-            dest_well = row[5],
-            volume = float(row[6]),
-            source_slot = src_slot[row[0]]
+            source_labware=src_labware,
+            source_well=expand_well_range(row[2], row[3]),
+            dest_name=row[4],
+            dest_well=row[5],
+            volume=float(row[6]),
+            source_slot=src_slot[row[0]]
         )
         transfers.append(transfer)
     return transfers
 
 
-# TODO:
 def add_parameters(parameters: protocol_api.ParameterContext):
-    """
-    Add runtime parameters to protocol
-    """
-    # Input CSV file
+    """Add runtime parameters to protocol."""
+
     # simulate-use: "C:\Users\seram\Downloads\PS_WS_prep_Remaining_Track(Prestock).csv"
     parameters.add_csv_file(
         variable_name="transfer_csv",
@@ -147,8 +103,6 @@ def add_parameters(parameters: protocol_api.ParameterContext):
         description="SOURCE PLATE, PART, WELL START, WELL END, DESTINATION RACK, DESTINATION WELL, VOLUME"
     )
 
-
-    # Input Source Plate Type
     # simulate-use: fisherscientific_96_wellplate_1200ul
     parameters.add_str(
         variable_name="source_labware",
@@ -158,159 +112,129 @@ def add_parameters(parameters: protocol_api.ParameterContext):
         choices=[{"display_name": "ThermoScientific 1200ul", "value": "fisherscientific_96_wellplate_1200ul"}]
     )
 
-    # Input Transfer Volume
-    # simulate-use: 5.0
-    parameters.add_float(
-        variable_name="transfer_volume",
-        display_name="Transfer Volume",
-        description="Volume to transfer from source plate to prestock tube (uL)",
-        default = 5.0,
-        minimum = 1.0,
-        maximum = 10.0
+    # simulate-use: left
+    parameters.add_str(
+        variable_name="pipette_mount",
+        display_name="1000ul Pipette Mount",
+        description="Location of mount for 1000ul Pipette",
+        default="left",
+        choices=[{"display_name": "Right", "value": "right"}, {"display_name": "Left", "value": "left"}]
     )
 
-    # Allow Tip Refill
-    # parameters.add_bool(
-    #     variable_name="tip_refill",
-    #     display_name="Allow Tip Refill",
-    #     description="Allow protocol to pause to manually refill tips",
-    #     default = True,
-    # )
 
-def set_source_plate_slots(csv_data: List[List[str]]) -> dict[str, str]:
+def set_source_plate_slots(csv_data: List[List[str]]) -> dict:
+    """
+    Assigns on-deck slots to unique source plates found in the CSV.
+    Raises an error if more than 4 unique source plates are present.
+    """
     source_slots = ['D2', 'C2', 'B2', 'A2']
-    source_plate_names = {row[0]: 0 for row in csv_data[1:]} #
+    source_plate_names = list(dict.fromkeys(row[0] for row in csv_data[1:]))
+
+    if len(source_plate_names) > len(source_slots):
+        raise ValueError(
+            f"CSV contains {len(source_plate_names)} unique source plates, "
+            f"but only {len(source_slots)} on-deck slots are available. "
+            f"Split your CSV into batches of {len(source_slots)} plates."
+        )
+
+    return {plate: source_slots[i] for i, plate in enumerate(source_plate_names)}
 
 
-
-    print(list(source_plate_names.keys()))
-
-    source_plates_slots = {}
-
-    # Iterate through the source_plate_names and assign locations to a repeating list
-    for i, plate in enumerate(source_plate_names.keys()):
-        source_plates_slots[plate] = source_slots[i % len(source_slots)]
-
-    return source_plates_slots
-
-def expand_well_range(start_well, end_well):
+def expand_well_range(start_well: str, end_well: str) -> list:
     """
     Expands a well range (e.g., 'A1' to 'B12') into a list of individual wells.
     Assumes standard 96-well plate format (A-H rows, 1-12 columns).
     """
-    # Parse start well
+    if not start_well:
+        return []
+
+    start_row = ord(start_well[0]) - ord('A')
+    start_col = int(start_well[1:]) - 1
+    end_row = ord(end_well[0]) - ord('A')
+    end_col = int(end_well[1:]) - 1
+
     wells = []
-
-    # Water does not have a start location, so ignore empty cell
-    if (start_well != ''):
-        # Parse start well
-        start_row = ord(start_well[0]) - ord('A')  # Convert letter to number (A=0, B=1, etc.)
-        start_col = int(start_well[1:]) - 1  # Convert to 0-indexed
-
-        # Parse end well
-        end_row = ord(end_well[0]) - ord('A')
-        end_col = int(end_well[1:]) - 1
-
-        # Generate list of wells
-
-        for row in range(start_row, end_row):
-            for col in range(12):
-                well_name = f"{chr(ord('A') + row)}{col + 1}"
-                wells.append(well_name)
-        for col in range(0, end_col + 1):
-            well_name = f"{chr(ord('A') + end_row)}{col + 1}"
-            wells.append(well_name)
+    for row in range(start_row, end_row + 1):
+        col_start = start_col if row == start_row else 0
+        col_end = end_col if row == end_row else 11
+        for col in range(col_start, col_end + 1):
+            wells.append(f"{chr(ord('A') + row)}{col + 1}")
 
     return wells
 
-def calculate_tips(transfers):
+
+def calculate_tips(transfers: List[Transfer]) -> int:
     """
-    Calculates the number of tips used in the protocol, assuming only single transfers
-    and returns the number of 1000ul tip boxes needed
-    :argument: list of transfers (np array)
-    :return: number of 1000ul tip boxes (int)
+    Returns the number of 1000ul tip racks needed for the protocol,
+    based on one tip per source well across all transfers.
     """
+    total_tips = sum(len(t.source_well) for t in transfers)
+    return math.ceil(total_tips / 96)
 
-    total_tips_1000 = sum(len(expand_well_range(row[2], row[3]))for row in transfers)
 
-    return math.ceil(total_tips_1000 / 96)
-
-def update_deck(on_deck_plates, off_deck_plates, on_deck_tips, off_deck_tips, protocol):
+def validate_transfers(transfers: List[Transfer], source_plate_slots: dict):
     """
-    Once all the plates on the deck have been used and tip boxes are empty
-    replaces on_deck_plates and its corresponding tips with new plates and tips from
-    off the deck
-    
-    :param on_deck_plates:
-    :param off_deck_plates:
-    :param on_deck_tips:
-    :param off_deck_tips:
-    :return:
+    Checks transfer data for common errors before the run starts.
+    Raises ValueError with a descriptive message if any issue is found.
     """
+    valid_dest_wells = {
+        f"{r}{c}" for r in "ABCD" for c in range(1, 7)
+    }
 
-    ps_rack_location = "4"
-    for slot in protocol.loaded_labware.keys():
-        labware_at_slot = str(protocol.deck[slot]) # Returns labware or none if empty
-        #
-        if labware_at_slot != 'None' and slot != ps_rack_location:
-            protocol.move_labware(labware = labware_at_slot, location = slot)
+    for i, t in enumerate(transfers):
+        row_num = i + 2  # account for header row
 
+        if t.source_name not in source_plate_slots:
+            raise ValueError(f"Row {row_num}: Source plate '{t.source_name}' not in deck slot mapping.")
 
-# TODO: def validate_data_rows(data_rows):
-"""
-for each row, ensure row length matches # of headers or locate rows with empty
-values (destination, source etc.) 
-"""
+        if not t.source_well:
+            raise ValueError(f"Row {row_num}: Well range is empty for part '{t.source_part}'.")
+
+        if t.dest_well not in valid_dest_wells:
+            raise ValueError(f"Row {row_num}: Destination well '{t.dest_well}' is not valid for a 24-tube rack.")
+
+        if t.volume <= 0:
+            raise ValueError(f"Row {row_num}: Transfer volume must be positive, got {t.volume}.")
 
 
 def run(protocol: protocol_api.ProtocolContext):
-    # Input runtime arguments
 
     source_labware = protocol.params.source_labware
-
     csv_data = protocol.params.transfer_csv.parse_as_csv()
     csv_data = [row[:7] for row in csv_data]
-    if csv_data[0][0].startswith("\ufeff"):
-        csv_data[0][0] = csv_data[0][0][1:]  # Removes \ufeff (BOM) character
 
-    # Fisher Scientific Plates
+    # Strip BOM character if present (common in Windows-exported CSVs)
+    if csv_data[0][0].startswith("\ufeff"):
+        csv_data[0][0] = csv_data[0][0][1:]
+
     CUSTOM_LABWARE = json.loads(
         """{"custom_beta/fisherscientific_96_wellplate_1200ul/1":{"ordering":[["A1","B1","C1","D1","E1","F1","G1","H1"],["A2","B2","C2","D2","E2","F2","G2","H2"],["A3","B3","C3","D3","E3","F3","G3","H3"],["A4","B4","C4","D4","E4","F4","G4","H4"],["A5","B5","C5","D5","E5","F5","G5","H5"],["A6","B6","C6","D6","E6","F6","G6","H6"],["A7","B7","C7","D7","E7","F7","G7","H7"],["A8","B8","C8","D8","E8","F8","G8","H8"],["A9","B9","C9","D9","E9","F9","G9","H9"],["A10","B10","C10","D10","E10","F10","G10","H10"],["A11","B11","C11","D11","E11","F11","G11","H11"],["A12","B12","C12","D12","E12","F12","G12","H12"]],"brand":{"brand":"Fisher Scientific","brandId":["SP-1081"]},"metadata":{"displayName":"Fisher Scientific 96 Well Plate 1200 µL","displayCategory":"wellPlate","displayVolumeUnits":"µL","tags":[]},"dimensions":{"xDimension":127.76,"yDimension":85.48,"zDimension":42.5},"wells":{"A1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":74.24,"z":3.15},"B1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":65.24,"z":3.15},"C1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":56.24,"z":3.15},"D1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":47.24,"z":3.15},"E1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":38.24,"z":3.15},"F1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":29.24,"z":3.15},"G1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":20.24,"z":3.15},"H1":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":14.38,"y":11.24,"z":3.15},"A2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":74.24,"z":3.15},"B2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":65.24,"z":3.15},"C2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":56.24,"z":3.15},"D2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":47.24,"z":3.15},"E2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":38.24,"z":3.15},"F2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":29.24,"z":3.15},"G2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":20.24,"z":3.15},"H2":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":23.38,"y":11.24,"z":3.15},"A3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":74.24,"z":3.15},"B3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":65.24,"z":3.15},"C3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":56.24,"z":3.15},"D3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":47.24,"z":3.15},"E3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":38.24,"z":3.15},"F3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":29.24,"z":3.15},"G3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":20.24,"z":3.15},"H3":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":32.38,"y":11.24,"z":3.15},"A4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":74.24,"z":3.15},"B4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":65.24,"z":3.15},"C4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":56.24,"z":3.15},"D4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":47.24,"z":3.15},"E4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":38.24,"z":3.15},"F4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":29.24,"z":3.15},"G4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":20.24,"z":3.15},"H4":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":41.38,"y":11.24,"z":3.15},"A5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":74.24,"z":3.15},"B5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":65.24,"z":3.15},"C5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":56.24,"z":3.15},"D5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":47.24,"z":3.15},"E5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":38.24,"z":3.15},"F5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":29.24,"z":3.15},"G5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":20.24,"z":3.15},"H5":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":50.38,"y":11.24,"z":3.15},"A6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":74.24,"z":3.15},"B6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":65.24,"z":3.15},"C6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":56.24,"z":3.15},"D6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":47.24,"z":3.15},"E6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":38.24,"z":3.15},"F6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":29.24,"z":3.15},"G6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":20.24,"z":3.15},"H6":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":59.38,"y":11.24,"z":3.15},"A7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":74.24,"z":3.15},"B7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":65.24,"z":3.15},"C7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":56.24,"z":3.15},"D7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":47.24,"z":3.15},"E7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":38.24,"z":3.15},"F7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":29.24,"z":3.15},"G7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":20.24,"z":3.15},"H7":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":68.38,"y":11.24,"z":3.15},"A8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":74.24,"z":3.15},"B8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":65.24,"z":3.15},"C8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":56.24,"z":3.15},"D8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":47.24,"z":3.15},"E8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":38.24,"z":3.15},"F8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":29.24,"z":3.15},"G8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":20.24,"z":3.15},"H8":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":77.38,"y":11.24,"z":3.15},"A9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":74.24,"z":3.15},"B9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":65.24,"z":3.15},"C9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":56.24,"z":3.15},"D9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":47.24,"z":3.15},"E9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":38.24,"z":3.15},"F9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":29.24,"z":3.15},"G9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":20.24,"z":3.15},"H9":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":86.38,"y":11.24,"z":3.15},"A10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":74.24,"z":3.15},"B10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":65.24,"z":3.15},"C10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":56.24,"z":3.15},"D10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":47.24,"z":3.15},"E10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":38.24,"z":3.15},"F10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":29.24,"z":3.15},"G10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":20.24,"z":3.15},"H10":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":95.38,"y":11.24,"z":3.15},"A11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":74.24,"z":3.15},"B11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":65.24,"z":3.15},"C11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":56.24,"z":3.15},"D11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":47.24,"z":3.15},"E11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":38.24,"z":3.15},"F11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":29.24,"z":3.15},"G11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":20.24,"z":3.15},"H11":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":104.38,"y":11.24,"z":3.15},"A12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":74.24,"z":3.15},"B12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":65.24,"z":3.15},"C12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":56.24,"z":3.15},"D12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":47.24,"z":3.15},"E12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":38.24,"z":3.15},"F12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":29.24,"z":3.15},"G12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":20.24,"z":3.15},"H12":{"depth":39.35,"totalLiquidVolume":1200,"shape":"circular","diameter":7,"x":113.38,"y":11.24,"z":3.15}},"groups":[{"metadata":{"wellBottomShape":"u"},"wells":["A1","B1","C1","D1","E1","F1","G1","H1","A2","B2","C2","D2","E2","F2","G2","H2","A3","B3","C3","D3","E3","F3","G3","H3","A4","B4","C4","D4","E4","F4","G4","H4","A5","B5","C5","D5","E5","F5","G5","H5","A6","B6","C6","D6","E6","F6","G6","H6","A7","B7","C7","D7","E7","F7","G7","H7","A8","B8","C8","D8","E8","F8","G8","H8","A9","B9","C9","D9","E9","F9","G9","H9","A10","B10","C10","D10","E10","F10","G10","H10","A11","B11","C11","D11","E11","F11","G11","H11","A12","B12","C12","D12","E12","F12","G12","H12"]}],"parameters":{"format":"irregular","quirks":[],"isTiprack":false,"isMagneticModuleCompatible":false,"loadName":"fisherscientific_96_wellplate_1200ul"},"namespace":"custom_beta","version":1,"schemaVersion":2,"cornerOffsetFromSlot":{"x":0,"y":0,"z":0}}}""")
 
     # Load trash bin
     trash = protocol.load_trash_bin('A3')
 
-    # Load Tip Racks
-    # Calculate number of tips used in transfers and number of tip racks
-    # Note: For this protocol, we assume all transfers are with 1-channel
-    total_tip_racks_1000 = calculate_tips(csv_data[1:])
+    # Parse CSV and determine source plate layout
+    source_plate_slots = set_source_plate_slots(csv_data)
 
-    # Available slots for 1000 µL tip racks (max 4)
+    # Build Transfer objects and validate before loading any labware
+    transfers = read_transfers(csv_data, source_labware, source_plate_slots)
+    validate_transfers(transfers, source_plate_slots)
+
+    # Calculate tip rack requirements
+    total_tip_racks_1000 = calculate_tips(transfers)
     available_slots_1000 = ['B3', 'C3', 'D3', 'C1']
     num_tip_racks_to_load = min(total_tip_racks_1000, len(available_slots_1000))
-    off_deck_tips = total_tip_racks_1000 - num_tip_racks_to_load
+    off_deck_tip_count = total_tip_racks_1000 - num_tip_racks_to_load
 
-    # 1000ul Tip Racks, occupy the far right column and one slot at D1 (bottom left)
     tip_racks_1000 = [
         protocol.load_labware('opentrons_flex_96_tiprack_1000ul', slot)
         for slot in available_slots_1000[:num_tip_racks_to_load]
     ]
-
-    # Load remaining tip racks "Off-Deck"
-    load_off_deck = [
+    off_deck_tips = [
         protocol.load_labware('opentrons_flex_96_tiprack_1000ul', protocol_api.OFF_DECK)
-        for i in range(off_deck_tips)
+        for _ in range(off_deck_tip_count)
     ]
-
-    #Include both on_deck and off deck tip_racks
-    tip_racks_1000.extend(load_off_deck)
-
-    # 500ul Tip Racks
-    # Note: This protocol does not use any 500ul tips, adjust as needed
-    tip_racks_500 = [
-        protocol.load_labware('opentrons_flex_96_tiprack_500ul', slot)
-        for slot in []
-    ]
+    tip_racks_1000.extend(off_deck_tips)
 
     pipette_left = protocol.load_instrument(
         'flex_1channel_1000',
@@ -318,27 +242,16 @@ def run(protocol: protocol_api.ProtocolContext):
         tip_racks=tip_racks_1000
     )
 
-    # Dictionary to store loaded labware
+    # Load source plates onto deck
     source_plates = {}
-    source_plate_slots = set_source_plate_slots(csv_data)
-
-    # Set starting locations for source plates
-    # Plates 1-4 (on-deck) and 5+ are off-deck
-    off_deck_plates = []
-    for i, (plate, slot) in enumerate(source_plate_slots.items()):
-        if i < 4:
-            loc = slot
-        else:
-            loc = protocol_api.OFF_DECK
-            off_deck_plates.append(plate) # Add plate to off_deck
-
-        source_plates[plate] = protocol.load_labware_from_definition(
-                CUSTOM_LABWARE["custom_beta/fisherscientific_96_wellplate_1200ul/1"],  # Adjust labware type as needed
-                location= loc,
-                label=plate
+    for plate_name, slot in source_plate_slots.items():
+        source_plates[plate_name] = protocol.load_labware_from_definition(
+            CUSTOM_LABWARE["custom_beta/fisherscientific_96_wellplate_1200ul/1"],
+            location=slot,
+            label=plate_name
         )
 
-    # Prestock Tube Rack and Reagents
+    # Load prestock tube rack
     tube_rack_1 = protocol.load_labware(
         "opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap",
         location="D1",
@@ -347,46 +260,18 @@ def run(protocol: protocol_api.ProtocolContext):
         version=3,
     )
 
-    # Liquid Definitions
-    liquid_1 = protocol.define_liquid(
-        "Water",
-        description = "water",
-        display_color="#9dffd8",
+    # Confirm deck layout and tip requirements before starting
+    deck_summary = [f"{slot}: {name}" for name, slot in source_plate_slots.items()]
+    protocol.pause(
+        f"This protocol requires {total_tip_racks_1000} x 1000ul tip rack(s). "
+        f"Deck layout: {deck_summary}. Press continue to start."
     )
-    liquid_2 = protocol.define_liquid(
-        "MgCl",
-        description="200nM MgCl",
-        display_color="#ff80f5",
-    )
-    liquid_3 = protocol.define_liquid(
-        "FOB",
-        description="10x FOB",
-        display_color="#7eff42",
-    )
-    liquid_4 = protocol.define_liquid(
-        "Scaffold",
-        description="100nM Scaffold",
-        display_color="#ff4f4f",
-    )
-    # Process csv list into Transfers object with inputted source labware and mapped source slots
-    transfers = read_transfers(csv_data, source_labware, source_plate_slots)
-    labwares = {slot:item for slot, item in protocol.deck.items()}
-    slots_to_remove = ['A1', 'B1', 'A3', 'A4', 'B4', 'C4', 'D4']
-    filtered_labwares = {slot:item for slot, item in labwares.items() if slot not in slots_to_remove}
-    sorted_labwares = sorted(labwares.items(), key=lambda item: item[0])
 
-    validate_labware = [f"{slot}: {item}" for slot, item in filtered_labwares.items()]
-
-    protocol.pause(f"This protocol requires ({total_tip_racks_1000}) 1000ul tip racks. Press continue to confirm or try protocol again with less transfers.")
-    protocol.pause(f"Confirm Deck Layout: {str(validate_labware)}")
-
-    i = 0
+    # Execute transfers
     for transfer in transfers:
-        # Set source and destination slots
-        source = source_plates[transfer.source_name] # Get source plate object
+        source = source_plates[transfer.source_name]
         destination = tube_rack_1
 
-        # Transfer liquid
         pipette_left.transfer(
             volume=transfer.volume,
             source=[source.wells_by_name()[well] for well in transfer.source_well],
@@ -394,21 +279,12 @@ def run(protocol: protocol_api.ProtocolContext):
             new_tip='always'
         )
 
-        # If tips run out & plates run out, pause and reconfigure set up (ex. load 4 tip racks and 4 plates.
-        # Do a test protocol with just the pause and move
-        # protocol.pause("Tips have run out. Please replace with tip boxes and plates from off-deck." source plate to position)
-        # For the first four plates, protocol.move_labware(labware=source
-        # update off_deck plates
-        # move off_deck to on update on_deck plates
-        # To put a new tip box inside the robot, print a message
-
         protocol.comment(
             f"Transferred {transfer.volume} µL from {transfer.source_name} "
-            f"wells {transfer.source_well[0]}-{transfer.source_well[-1]} ({len(transfer.source_well)} wells) "
-            f"to {transfer.dest_name} well {transfer.dest_well} for {transfer.source_part} prestock"
+            f"wells {transfer.source_well[0]}-{transfer.source_well[-1]} "
+            f"({len(transfer.source_well)} wells) "
+            f"to {transfer.dest_name} well {transfer.dest_well} "
+            f"for {transfer.source_part} prestock"
         )
 
-        i += 1
-
-## Add Pause
-    protocol.pause("Continue to make working stock")
+    protocol.pause("Prestock preparation complete. Continue to make working stock.")

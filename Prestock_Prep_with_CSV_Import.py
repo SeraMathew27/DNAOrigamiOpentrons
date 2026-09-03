@@ -109,7 +109,7 @@ def add_parameters(parameters: protocol_api.ParameterContext):
         display_name="Source Labware",
         description="Select source plate model",
         default="fisherscientific_96_wellplate_1200ul",
-        choices=[{"display_name": "ThermoScientific 1200ul", "value": "fisherscientific_96_wellplate_1200ul"}]
+        choices=[{"display_name": "ThermoScientific 1200ul", "value": "fisherscientific_96_wellplate_1200ul"},{"display_name": "Eurofin 500ul (Greiner)", "value": "greiner_96_wellplate_500ul"}]
     )
 
     # simulate-use: left

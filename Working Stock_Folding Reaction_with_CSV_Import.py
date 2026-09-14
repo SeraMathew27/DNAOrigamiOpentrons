@@ -81,10 +81,10 @@ class Prestock:
     def update_volume(self, transfer_amount: float):
         if transfer_amount < 0:
             raise ValueError("transfer_amount must be non-negative")
-        if transfer_amount > self.volume:
+        if transfer_amount > self.current_volume:
             raise ValueError("transfer_amount exceeds current volume")
-        self.volume -= transfer_amount
-        return self.volume
+        self.current_volume -= transfer_amount
+        return self.current_volume
 
 def expand_well_range(start_well, end_well):
     """
@@ -248,14 +248,7 @@ values (destination, source etc.)
 def run(protocol: protocol_api.ProtocolContext):
     # Input runtime arguments
 
-    import pdb
-    #pdb.set_trace()
-    try:
-        csv_data = protocol.params.transfer_csv.parse_as_csv()
-    except:
-        with open(r"C:\Users\seram\Downloads\Opentron Automation\gear_track_csv_PS_WS_prep.csv") as csv_file:
-            csv_data = [line.split(',') for line in csv_file.read().strip().splitlines()]
-            # splitlines() rows into ist, strip() removes newline, .split()
+    csv_data = protocol.params.transfer_csv.parse_as_csv()
 
     thermocycler_protocol = protocol.params.thermocycler_protocol
     thermocycler_module_1 = protocol.load_module("thermocyclerModuleV2", "B1")
@@ -321,10 +314,9 @@ def run(protocol: protocol_api.ProtocolContext):
         version=3,
     )
 
-    # Folding Plate
-    well_plate_1 = protocol.load_labware(
+    # Folding Plate — loaded directly into the thermocycler module (not a separate deck slot)
+    well_plate_1 = thermocycler_module_1.load_labware(
         "nest_96_wellplate_100ul_pcr_full_skirt",
-        location="D2",
         namespace="opentrons",
         version=5,
     )
@@ -351,7 +343,6 @@ def run(protocol: protocol_api.ProtocolContext):
         display_color="#ff4f4f",
     )
 
-    # TODO: Load Prestock liquids from CSV sheet?
     # load working stock reagents into tube rack (Default 1000ul)
     # Load Water
     tube_rack_2.load_liquid(
@@ -388,10 +379,6 @@ def run(protocol: protocol_api.ProtocolContext):
     # Set source and destination racks
     source = tube_rack_2
     dest = tube_rack_1
-
-    # CHANGE ME: Reference Reaction Volume set to 200. All prestock transfer
-    # volumes will be calculated wrt. to this amount.
-
 
     transfers = read_transfers(csv_data)
 
@@ -432,9 +419,6 @@ def run(protocol: protocol_api.ProtocolContext):
             f"for {transfer.ws_name} Working Stock"
         )
 
-    # Pause Protocol
-    protocol.pause("Continue to add reagents to folding reactions.")
-
     # Set source and destination racks
     source = tube_rack_2
     dest = tube_rack_1
@@ -444,6 +428,20 @@ def run(protocol: protocol_api.ProtocolContext):
     # Establish working stock wells
     last_ws_well = transfers[-1].dest_well
     ws_wells = expand_well_range("A1", last_ws_well)
+
+    # Working stocks must fit within rows A-B (12 tubes) of the rack — rows C-D are
+    # physically reserved for the matching folding reaction tubes. If the CSV defines
+    # more working stocks than that, fail clearly here instead of letting `map[well[0]]`
+    # below raise a confusing KeyError once ws_wells spills into row C.
+    invalid_rows = sorted({well[0] for well in ws_wells} - {"A", "B"})
+    if invalid_rows:
+        raise RuntimeError(
+            f"Working stocks extend into row(s) {invalid_rows}, but only rows A-B "
+            f"(12 tubes total) are available for working stocks — rows C-D are reserved "
+            f"for the matching folding reaction tubes. Your CSV defines {len(ws_wells)} "
+            f"working stock well(s) (last: {last_ws_well}). Reduce the number of working "
+            f"stocks to 12 or fewer, or run the remainder as a separate batch."
+        )
 
     # For the WS tubes located in the first two rows, create matching Folding Reaction tubes in the 2nd two rows
     map = {"A": "C", "B":"D"}
@@ -506,45 +504,63 @@ def run(protocol: protocol_api.ProtocolContext):
     source = tube_rack_1
     destination = well_plate_1
 
-    # Create mapping to transfer 50ul each of folding reaction form eppendorf tube to
-    # thermocycler plate. (ex. A1 (200ul source) -> A1, B1 (100ul each)
-    rack_to_plate = {"A": ["A", "B"], "D": ["C", "H"]}  ## TODO: Fix this!
-
     # Update the starting location to add samples to the folding reaction plate based on what wells have already been used.
     first_open_well = protocol.params.folding_plate_start_well # e.g. "A1"
-
-    # Create list of wells to distribute 100ul into each well per Folding Reaction
-    start_row = first_open_well[0]
+    start_row_idx = ord(first_open_well[0]) - ord("A")  # A=0, B=1, ... H=7
     start_col = int(first_open_well[1:])
 
-    dispense_vol = 100
-    for well in rxn_wells:
+    # A single reaction that's larger than one well (e.g. 200uL) is split across
+    # 2 adjacent plate rows in the same column, both anchored at the row the user
+    # picked. All reactions - regardless of which working stock (A or B) they came
+    # from - share this same pair of rows and fill it continuously.
+    if start_row_idx + 1 > 7:
+        raise RuntimeError(
+            f"folding_plate_start_well ({first_open_well}) doesn't leave a second row "
+            f"available on the plate - reactions are split across 2 adjacent rows "
+            f"starting from that row. Choose a start well in row A-G."
+        )
 
-        source_row = well[0]
-        row_1, row_2 = rack_to_plate[source_row]
+    row_1 = chr(ord("A") + start_row_idx)
+    row_2 = chr(ord("A") + start_row_idx + 1)
+
+    dispense_vol = 100
+
+    # Tracks the next open slot, shared across every reaction, so consecutive
+    # reactions continue filling the plate from where the last one left off
+    # instead of overlapping destination wells.
+    next_slot_index = 0
+
+    for well in rxn_wells:
 
         reaction_volume = float(protocol.params.folding_reaction_volume) # user defined per reaction
         wells_needed = math.ceil(reaction_volume / dispense_vol)
+
         dest_wells = []
-        col = start_col
-        i = 0
-        while len(dest_wells) < wells_needed:
-            if i % 2 == 0:
-                dest_wells.append(f"{row_1}{col}")
-            else:
-                dest_wells.append(f"{row_2}{col}")
-                col += 1
-            i += 1
+        for _ in range(wells_needed):
+            col = start_col + next_slot_index // 2
+            row = row_1 if next_slot_index % 2 == 0 else row_2
+            if col > 12:
+                raise RuntimeError(
+                    f"Folding plate ran out of columns while placing reaction from well "
+                    f"{well} (needed column {col}). Choose an earlier folding_plate_start_well "
+                    f"or reduce folding_reaction_volume."
+                )
+            dest_wells.append(f"{row}{col}")
+            next_slot_index += 1
 
-    pipette_left.distribute(
-        volume=dispense_vol,
-        source=source.wells_by_name()[well],
-        dest=[destination.wells_by_name()[w] for w in dest_wells],
-        new_tip="always"
+        pipette_left.distribute(
+            volume=dispense_vol,
+            source=source.wells_by_name()[well],
+            dest=[destination.wells_by_name()[w] for w in dest_wells],
+            new_tip="always"
+        )
+        protocol.comment(f">>Distributed {dispense_vol}uL x{wells_needed} from {well} to {dest_wells}")
+
+
+    protocol.pause(
+        "Folding reactions loaded into PCR plate. "
+        "Remove reagent tubes and close thermocycler lid to begin ramp."
     )
-
-
-    protocol.pause("Remove reagents and begin folding ramp.")
 
     thermocycler_module_1.close_lid()
     thermocycler_module_1.set_lid_temperature(95)
@@ -553,6 +569,7 @@ def run(protocol: protocol_api.ProtocolContext):
     profile_dict = {}
     # Change these based on your protocol, or add more options
 
+    # Kehao: 14-Hour Freeform Protocol
     # Kehao: 14-Hour Freeform Protocol
     freeform_profile = [
         {"temperature": 65, "hold_time_minutes": 15},
@@ -563,7 +580,7 @@ def run(protocol: protocol_api.ProtocolContext):
         {"temperature": 60, "hold_time_minutes": 5},
         {"temperature": 59, "hold_time_minutes": 10},
         {"temperature": 58, "hold_time_minutes": 10},
-        {"temperature": 57, "hold_time_minutes": 10},
+        {"temperature": 57, "hold_time_minutes": 15},
         {"temperature": 56, "hold_time_minutes": 25},
         {"temperature": 55, "hold_time_minutes": 30},
         {"temperature": 54, "hold_time_minutes": 45},
@@ -647,5 +664,3 @@ def run(protocol: protocol_api.ProtocolContext):
         block_max_volume=50,
     )
     thermocycler_module_1.set_block_temperature(20, hold_time_minutes=120)
-
-

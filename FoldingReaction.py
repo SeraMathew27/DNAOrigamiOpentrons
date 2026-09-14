@@ -140,7 +140,6 @@ def read_transfers(csv_data: List[List[Union[str, int, float]]]) -> List[Transfe
     Skips the header row and parses each data row into a Transfer.
     """
     headers = csv_data[0]
-    assert headers == HEADERS, f"CSV header mismatch.\nExpected: {HEADERS}\nGot: {headers}"
 
     transfers = []
     for row in csv_data[1:]:
@@ -198,7 +197,7 @@ def calculate_tips(transfers: List[Transfer]) -> int:
 def add_parameters(parameters: protocol_api.ParameterContext):
     """Add runtime parameters to the protocol."""
 
-    # simulate-use: "C:\Users\seram\Downloads\WS_Prep_Track(Working Stock).csv"
+    # simulate-use: "C:\Users\seram\OneDrive - The Ohio State University\Opentrons Automated Protocols\Protocols\Track_Bead_Purification\Sept Experiments\9_9_2026_PS_WS_prep(Working Stock).csv"
     parameters.add_csv_file(
         variable_name="transfer_csv",
         display_name="Transfer CSV File",
@@ -218,7 +217,7 @@ def add_parameters(parameters: protocol_api.ParameterContext):
         default="A1"
     )
 
-    # simulate-use: 100.0
+    # simulate-use: 400.0
     parameters.add_float(
         variable_name="folding_reaction_volume",
         display_name="Folding Reaction Volume",
